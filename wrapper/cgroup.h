@@ -85,6 +85,7 @@ struct cgroup_subsys_state* wrapper_css_next_descendant_pre
 	}
 }
 
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0))
 /* Helper function, (too) recently exposed in include/linux/cgroup.h */
 static inline struct cgroup *cgroup_parent(struct cgroup *cgrp)
 {
@@ -94,6 +95,7 @@ static inline struct cgroup *cgroup_parent(struct cgroup *cgrp)
 		return container_of(parent_css, struct cgroup, self);
 	return NULL;
 }
+#endif
 
 static inline
 bool* wrapper_get_cgrp_dfl_visible(void)
