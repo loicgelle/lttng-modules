@@ -46,9 +46,13 @@
 #include <linux/wait.h>
 #include <linux/mutex.h>
 #include <linux/device.h>
+#include <linux/seq_file.h>
+#include <linux/cgroup.h>
+#include <../kernel/cgroup/cgroup-internal.h>
 
 #include <lttng-events.h>
 #include <lttng-tracer.h>
+#include <wrapper/cgroup.h>
 #include <wrapper/irqdesc.h>
 #include <wrapper/spinlock.h>
 #include <wrapper/fdtable.h>
@@ -431,6 +435,32 @@ void lttng_statedump_process_ns(struct lttng_session *session,
 #endif
 }
 
+/*
+ * Called with task lock held.
+ */
+static
+void lttng_statedump_process_cgroup(struct lttng_session *session,
+		struct task_struct *p)
+{
+	struct css_set *css_set;
+	struct cgroup_subsys_state *css;
+	struct cgroup *cgrp;
+	int i;
+
+	rcu_read_lock();
+	css_set = p->cgroups;
+
+	for(i = 0; i < CGROUP_SUBSYS_COUNT; i++) {
+		css = css_set->subsys[i];
+		cgrp = css->cgroup;
+		if (css)
+			printk(KERN_INFO "LTTng cgroups: process_tid=%d; cgroup_hierarchy_id=%d; cgroup_id=%d",
+					p->pid, cgrp->root->hierarchy_id, cgrp->id);	
+	}
+
+	rcu_read_unlock();
+}
+
 static
 int lttng_enumerate_process_states(struct lttng_session *session)
 {
@@ -482,10 +512,196 @@ int lttng_enumerate_process_states(struct lttng_session *session)
 				type = LTTNG_KERNEL_THREAD;
 			lttng_statedump_process_ns(session,
 				p, type, mode, submode, status);
+			lttng_statedump_process_cgroup(session, p);
 			task_unlock(p);
 		} while_each_thread(g, p);
 	}
 	rcu_read_unlock();
+
+	return 0;
+}
+
+static
+void lttng_dump_cgroup_file_param(struct lttng_session *session,
+		struct cgroup *cgrp, struct cgroup_subsys_state *css,
+		struct cftype *cft, struct seq_file *sf, struct kernfs_node *kn,
+		struct kernfs_open_file *of) {
+	if (cft->read_u64) {
+		u64 param_val = cft->read_u64(css, cft);
+		printk(KERN_INFO "param %s, value %llu", cft->name, param_val);
+	}
+	if (cft->read_s64) {
+		s64 param_val = cft->read_s64(css, cft);
+		printk(KERN_INFO "param %s, value %lld", cft->name, param_val);
+	}
+	if (cft->seq_show) {
+		int seq_ret;
+		void *old_kn_parent;
+		void *old_kn_priv;
+
+		printk(KERN_INFO "param %s follows", cft->name);
+
+		of->kn = cgrp->kn;
+		sf->private = of;
+
+		/* HORRIBLE CODE FOLLOWS */
+		old_kn_parent = cgrp->kn->parent;
+		old_kn_priv = cgrp->kn->priv;
+		cgrp->kn->parent = kn;
+		kn->priv = cgrp;
+		cgrp->kn->priv = cft;
+
+		if (cft->seq_start) {
+			void *v;
+			loff_t pos;
+			pos = 0;
+			v = cft->seq_start(sf, &pos);
+			while (v) {
+				sf->from = 0;
+				sf->count = 0;
+				sf->pad_until = 0;
+				sf->index = 0;
+				sf->read_pos = 0;
+				seq_ret = cft->seq_show(sf, v);
+				if (seq_ret)
+					printk(KERN_INFO "ERROR: param %s, ret %d", cft->name, seq_ret);
+				else {
+					printk(KERN_INFO "%s", sf->buf);
+					printk(KERN_INFO "----------------");
+				}
+				v = cft->seq_next(sf, v, &pos);
+			}
+			cft->seq_stop(sf, v);
+		} else {
+			sf->from = 0;
+			sf->count = 0;
+			sf->pad_until = 0;
+			sf->index = 0;
+			sf->read_pos = 0;
+			seq_ret = cft->seq_show(sf, NULL);
+			if (seq_ret)
+				printk(KERN_INFO "ERROR: param %s, ret %d", cft->name, seq_ret);
+			else {
+				printk(KERN_INFO "%s", sf->buf);
+				printk(KERN_INFO "----------------");
+			}
+		}
+
+		/* Let's clean up our mess */
+		cgrp->kn->parent = old_kn_parent;
+		cgrp->kn->priv = old_kn_priv;
+	}
+}
+
+static
+int lttng_enumerate_cgroups_states(struct lttng_session *session)
+{
+	struct cgroup_root *root;
+	bool cgrp_dfl_visible;
+	struct list_head* cgroup_roots_ptr;
+	struct cgroup_subsys **cgroup_subsys;
+
+	/* Fake seq_file variables */
+	struct seq_file *fake_sf;
+	struct kernfs_open_file *fake_of;
+	struct kernfs_node *fake_kn;
+	char *buf;
+	int buf_size;
+
+	/* Fake seq_file allocation and preparation */
+	buf_size = 5000; /* Ok that's quite a lot */
+	fake_sf = kmalloc(sizeof(struct seq_file), GFP_KERNEL);
+	fake_of = kmalloc(sizeof(struct kernfs_open_file), GFP_KERNEL);
+	fake_kn = kmalloc(sizeof(struct kernfs_node), GFP_KERNEL);
+	buf = kmalloc(buf_size, GFP_KERNEL);
+	fake_sf->buf = buf;
+	fake_sf->size = buf_size;
+
+	cgrp_dfl_visible = *wrapper_get_cgrp_dfl_visible();
+	cgroup_roots_ptr = wrapper_get_cgroup_roots();
+	cgroup_subsys = wrapper_get_cgroup_subsys();
+
+	mutex_lock(&cgroup_mutex);
+	printk(KERN_INFO "LTTng cgroups: Holding locks...\n");
+
+	/* Iterate through the hierarchies */
+	list_for_each_entry((root), cgroup_roots_ptr, root_list) {
+		struct cgroup *cgrp, *d_cgrp;
+		struct cgroup_subsys *ss;
+		struct cgroup_subsys_state *css, *d_css;
+		int ssid;
+		struct cftype *cfts;
+		struct cftype *cft;
+
+		if (root == &cgrp_dfl_root && !cgrp_dfl_visible)
+			continue;
+
+		printk(KERN_INFO "Hierarchy ID %d:", root->hierarchy_id);
+		cgrp = &(root->cgrp);
+		if (strlen(root->name))
+			printk(KERN_INFO "Hierarchy name=%s", root->name);
+
+		for_each_subsys(ss, ssid) {
+			/* Check that the subsystem ss is attached to the hierarchy */
+			if (!(root->subsys_mask & (1 << ssid)))
+				continue;
+			if (strcmp(ss->name, "debug") == 0)
+				continue;
+			printk(KERN_INFO "subsystem names: %s, %s", ss->name, ss->legacy_name);				
+			css = wrapper_cgroup_get_e_css(cgrp, ss);
+			if (!css)
+				continue;
+			/* Iterate through descendant cgroup subsystems */	
+			rcu_read_lock();
+			wrapper_css_for_each_descendant_pre(d_css, css) {
+				int ancestor_id;
+				d_cgrp = d_css->cgroup;
+
+				if (d_cgrp->id == 1)
+					ancestor_id = 0;
+				else
+					ancestor_id = d_cgrp->ancestor_ids[d_cgrp->level - 1];
+
+				/* Print cgroup info */
+				printk(KERN_INFO "cgroup: hierarchy_id=%d; id=%d; ancestor_id=%d; name=%s",
+							root->hierarchy_id, d_cgrp->id, ancestor_id, d_cgrp->kn->name);
+
+				/* Print css info */
+				if (wrapper_cgroup_on_dfl(d_cgrp)) {
+					cfts = ss->dfl_cftypes;
+				} else {
+					cfts = ss->legacy_cftypes;
+				}
+				if (cfts) {
+					for (cft = cfts; cft->name[0] != '\0'; cft++) {
+						/* Skip cftype if flags indicate so */
+						if ((cft->flags & __CFTYPE_ONLY_ON_DFL) && !wrapper_cgroup_on_dfl(d_cgrp))
+							continue;
+						if ((cft->flags & __CFTYPE_NOT_ON_DFL) && wrapper_cgroup_on_dfl(d_cgrp))
+							continue;
+						if ((cft->flags & CFTYPE_NOT_ON_ROOT) && !cgroup_parent(d_cgrp))
+							continue;
+						if ((cft->flags & CFTYPE_ONLY_ON_ROOT) && cgroup_parent(d_cgrp))
+							continue;
+
+						lttng_dump_cgroup_file_param(session, d_cgrp, d_css, cft, fake_sf,
+									fake_kn, fake_of);
+					}
+				}
+			}
+			rcu_read_unlock();
+		}
+	}
+
+	/* Cleaning */
+	kfree(buf);
+	kfree(fake_of);
+	kfree(fake_kn);
+	kfree(fake_sf);
+
+	printk(KERN_INFO "LTTng cgroups: Releasing locks...\n");
+	mutex_unlock(&cgroup_mutex);
+	printk(KERN_INFO "LTTng cgroups: Locks released\n");
 
 	return 0;
 }
@@ -532,6 +748,10 @@ int do_lttng_statedump(struct lttng_session *session)
 	default:
 		return ret;
 	}
+
+	ret = lttng_enumerate_cgroups_states(session);
+	if (ret)
+		return ret;
 
 	/* TODO lttng_dump_idt_table(session); */
 	/* TODO lttng_dump_softirq_vec(session); */
