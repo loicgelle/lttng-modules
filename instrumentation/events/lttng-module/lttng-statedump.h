@@ -138,6 +138,111 @@ LTTNG_TRACEPOINT_EVENT(lttng_statedump_interrupt,
 	)
 )
 
+LTTNG_TRACEPOINT_EVENT(lttng_statedump_cgroup_process,
+	TP_PROTO(struct lttng_session *session,
+		struct task_struct *p,
+		struct cgroup *cgrp),
+	TP_ARGS(session, p, cgrp),
+	TP_FIELDS(
+		ctf_integer(pid_t, tid, p->pid)
+		ctf_integer(int, cgrp_id, cgrp->id)
+		ctf_integer(int, cgrp_hier_id, cgrp->root->hierarchy_id)
+	)
+)
+
+LTTNG_TRACEPOINT_EVENT(lttng_statedump_cgroup_hierarchy,
+	TP_PROTO(struct lttng_session *session,
+		struct cgroup_root *cgrp_root),
+	TP_ARGS(session, cgrp_root),
+	TP_FIELDS(
+		ctf_integer(int, id, cgrp_root->hierarchy_id)
+		ctf_string(name, strlen(cgrp_root->name) ? cgrp_root->name : "")
+	)
+)
+
+LTTNG_TRACEPOINT_EVENT(lttng_statedump_cgroup_subsys,
+	TP_PROTO(struct lttng_session *session,
+		struct cgroup_root *cgrp_root,
+		struct cgroup_subsys *ss,
+		int ssid),
+	TP_ARGS(session, cgrp_root, ss, ssid),
+	TP_FIELDS(
+		ctf_integer(int, hierarchy_id, cgrp_root->hierarchy_id)
+		ctf_integer(int, ssid, ssid)
+		ctf_string(name, ss->name ? : "")
+	)
+)
+
+LTTNG_TRACEPOINT_EVENT(lttng_statedump_cgroup,
+	TP_PROTO(struct lttng_session *session,
+		struct cgroup *cgrp),
+	TP_ARGS(session, cgrp),
+	TP_FIELDS(
+		ctf_integer(int, hierarchy_id, cgrp->root->hierarchy_id)
+		ctf_integer(int, id, cgrp->id)
+		ctf_integer(int, ancestor_id,
+			({
+				int ancestor_id;
+
+				if (cgrp->id == 1)
+					ancestor_id = 0;
+				else
+					ancestor_id = cgrp->ancestor_ids[cgrp->level - 1];
+				
+				ancestor_id;
+			}))
+		ctf_string(name, cgrp->kn->name ? : "")
+	)
+)
+
+LTTNG_TRACEPOINT_EVENT(lttng_statedump_cgroup_param_u64,
+	TP_PROTO(struct lttng_session *session,
+		struct cgroup *cgrp,
+		struct cftype *cft,
+		int ssid,
+		u64 val),
+	TP_ARGS(session, cgrp, cft, ssid, val),
+	TP_FIELDS(
+		ctf_integer(int, cgrp_hier_id, cgrp->root->hierarchy_id)
+		ctf_integer(int, cgrp_id, cgrp->id)
+		ctf_integer(int, ssid, ssid)
+		ctf_string(name, cft->name)
+		ctf_integer(u64, value, val)
+	)
+)
+
+LTTNG_TRACEPOINT_EVENT(lttng_statedump_cgroup_param_s64,
+	TP_PROTO(struct lttng_session *session,
+		struct cgroup *cgrp,
+		struct cftype *cft,
+		int ssid,
+		s64 val),
+	TP_ARGS(session, cgrp, cft, ssid, val),
+	TP_FIELDS(
+		ctf_integer(int, cgrp_hier_id, cgrp->root->hierarchy_id)
+		ctf_integer(int, cgrp_id, cgrp->id)
+		ctf_integer(int, ssid, ssid)
+		ctf_string(name, cft->name)
+		ctf_integer(s64, value, val)
+	)
+)
+
+LTTNG_TRACEPOINT_EVENT(lttng_statedump_cgroup_param_str,
+	TP_PROTO(struct lttng_session *session,
+		struct cgroup *cgrp,
+		struct cftype *cft,
+		int ssid,
+		char *buf),
+	TP_ARGS(session, cgrp, cft, ssid, buf),
+	TP_FIELDS(
+		ctf_integer(int, cgrp_hier_id, cgrp->root->hierarchy_id)
+		ctf_integer(int, cgrp_id, cgrp->id)
+		ctf_integer(int, ssid, ssid)
+		ctf_string(name, cft->name)
+		ctf_string(value, buf)
+	)
+)
+
 #endif /*  LTTNG_TRACE_LTTNG_STATEDUMP_H */
 
 /* This part must be outside protection */
